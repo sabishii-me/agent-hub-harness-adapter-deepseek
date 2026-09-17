@@ -1587,12 +1587,12 @@ function handle(msg) {
 case 'config/set': {
       process.stderr.write(`[adapter] config/set got ${JSON.stringify(params.config)}\n`);
       const cfg = params.config || {};
-      const model = cfg.model;
+      const model = cfg.model ?? (cfg.thinkingLevel !== undefined ? cfgApplied?.model : undefined);
       const presetId = cfg.presetId;
       const plan = cfg.plan;
       const review = cfg.review;
       const thinkingLevel = cfg.thinkingLevel;
-      if (model === undefined && presetId === undefined && plan === undefined && review === undefined) {
+      if (model === undefined && presetId === undefined && plan === undefined && review === undefined && thinkingLevel === undefined) {
         // connection-only set with no model/preset/plan/review: nothing applicable at creation
         if (!cfg.connectionId) { send({ jsonrpc: '2.0', id, result: {} }); return; }
       }
@@ -1669,7 +1669,7 @@ case 'config/set': {
         // efforts, or clear it, so switching models cannot leak an incompatible
         // effort. Never guess an effort the model does not list.
         const patch = { provider: routeId, model };
-        const efforts = (entry.reasoning && entry.reasoning.efforts) || [];
+        const efforts = ((entry.reasoning && entry.reasoning.efforts) || []).map((effort) => typeof effort === 'string' ? effort : effort.id);
         // A requested level must be one this model actually accepts; an omitted
         // level keeps dsh's own value rather than inventing one.
         if (thinkingLevel !== undefined && thinkingLevel !== null) {
