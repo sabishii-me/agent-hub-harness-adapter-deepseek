@@ -1,5 +1,6 @@
 {
   "id": "deepseek",
+  "version": "0.1.2",
   "protocol": 0,
   "command": [
     "node",

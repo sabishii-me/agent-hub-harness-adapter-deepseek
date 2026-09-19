@@ -1,9 +1,9 @@
-# sabishii-me-harness-deepseek — the DeepSeek Harness (`dsh`) plugin
+# sabishii-dev-harness-deepseek — the DeepSeek Harness (`dsh`) plugin
 
 The adapter spawns `dsh web --no-open --port 0` (the port is parsed from the server's stdout banner) and talks to it over loopback only: unary JSON-RPC (`POST /api/<method>`) plus one downlink WebSocket (`/api/events.mux`) carrying the harness's own session event stream — text and reasoning deltas, tool calls and results, approvals, questions, and real cross-process resume. Nothing in the harness is patched. Only the adapter that STARTED a home's server sweeps stale `hub-*` (and legacy `prts-*`) provider routes from it, so an attached adapter cannot delete a route a running session injected.
 
 This repository is one harness plugin for
-[`sabishii-me-agent-hub`](https://github.com/sabishii-me/sabishii-me-agent-hub): the
+[`sabishii-dev-agent-hub`](https://github.com/sabishii-dev/sabishii-dev-agent-hub): the
 adapter that drives DeepSeek Harness (`dsh`), its manifest, the harness-side extensions it installs,
 and (where the harness needs one) the preset definitions it applies. The hub's
 `docs/PROTOCOL.md` is the contract this adapter implements.
@@ -55,3 +55,13 @@ This repository is the plugin's home: edit here, commit, push. A deployment that
 composes plugins pins a commit (later a tag) of this repository and bumps the pointer
 there. The harness's own protocol quirks live in the adapter and belong to whoever
 tracks that harness.
+
+### Release identity and managed configuration
+
+The plugin release (manifest.version and package.json version) identifies adapter,
+extensions and installation declarations. runtime.package/version is a separate exact
+upstream pin. Adapter behavior changes OR a runtime pin change require a new plugin
+release and compatibility verification; upstream updates do not silently upgrade installs.
+0.1.2 is prepared locally, not published, with unchanged runtime pins.
+Managed configuration is application-owned. System configuration is not automatically
+imported. A future configuration-import provider requires explicit informed consent.
