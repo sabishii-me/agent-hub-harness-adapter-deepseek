@@ -31,10 +31,11 @@
 //                          editing the shared global config).
 //
 // Configuration face (PROTOCOL §6): connections/auth/models/credentials methods
-// are bridged to dsh's native settings.*, credentials.*, llm.* RPCs. Secrets
-// NEVER ride this path to disk: apiKeyEnv references are what get persisted;
-// values live in the shell keychain and cross into dsh's process env via
-// credentials/grant (re-granted every spawn). connections/validate uses
+// are bridged to dsh's native settings.*, credentials.*, llm.* RPCs. A secret the
+// user saves is written to THIS HARNESS'S OWN credential store (credentials.set ->
+// $DSH_HOME/.credentials.yaml, 0600) and rides the child env via credentials/grant
+// (hub-managed providers are re-granted every spawn; a private connection persists
+// in the harness's own store so the next launch still finds it). connections/validate uses
 // llm.discoverModels whose apiKey is write-only at the host ("never stored and
 // never returned").
 //
@@ -102,11 +103,8 @@ if (!fs.existsSync(DSH_BIN)) die(`dsh runtime not found: ${DSH_BIN} (the plugin'
 // and — worst — let the USER'S OWN settings decide the permission policy, so a
 // session could run with approvals suppressed while the hub believed it was
 // answering them. A managed spawn owns its harness home, full stop. The user's
-// own configuration is still BORROWED read-only once (settings.yaml, minus the
-// permission section) so their known connections keep working; nothing is
-// written back to their home.
+// own configuration is neither read nor imported; importing it requires consent.
 const DSH_HOME = path.join(DATA_DIR, 'dsh-home');
-const USER_DSH_HOME = path.join(os.homedir(), '.dsh');   // read-only: settings migration
 
 // hub-managed secrets live HERE ONLY (in-memory; PROTOCOL §6.2 zero-plaintext):
 // ENV-REF → value. They reach dsh exclusively through the child env.
@@ -198,26 +196,10 @@ function bootstrapHome() {
   installDshPresets();
   const settingsFile = path.join(DSH_HOME, 'settings.yaml');
   {
-    // CREATE ONLY once — dsh itself owns the file afterwards (settings.*
-    // writes live there; rewriting it on every boot would clobber the
-    // user's saved connections). Migration reads ~/.dsh/settings.yaml
-    // (settings carry apiKeyEnv REFS, never secret values) and drops the
-    // permission section; approvals-forcing happens over the settings RPC
-    // after boot. Credentials are NOT imported — plaintext stays in the
-    // user's own home; terminal env keys are inherited by the child,
-    // hub-managed keys arrive via credentials/grant (PROTOCOL §6.2).
+    // Initialize only our own defaults. System configuration import requires an
+    // explicit provider operation; an isolated home must not silently borrow it.
     if (!fs.existsSync(settingsFile)) {
-      let migrated = '';
-      const userSettings = path.join(USER_DSH_HOME, 'settings.yaml');
-      if (fs.existsSync(userSettings)) {
-        let skipping = false;
-        for (const l of fs.readFileSync(userSettings, 'utf8').split('\n')) {
-          const top = /^[A-Za-z][A-Za-z0-9_-]*:/.test(l);
-          if (top) skipping = l.startsWith('permission:');
-          if (!skipping) migrated += l + '\n';
-        }
-      }
-      fs.writeFileSync(settingsFile, migrated + 'permission:\n  defaultPreset: workspace-write\n');
+      fs.writeFileSync(settingsFile, ['permission:', '  defaultPreset: workspace-write', ''].join(String.fromCharCode(10)));
     }
   }
 }
@@ -367,6 +349,24 @@ function reallySpawn(fixedPort) {
   });
   if (shared) { try { child.unref(); } catch {} }
   process.stderr.write(`[adapter] dsh spawned pid=${child.pid} cwd=${DATA_DIR} home=${DSH_HOME} grantedRefs=${grants.size} detached=${shared}\n`);
+  // The harness's own output explains an exit; without a prefix and without keeping its
+  // last lines, the client only ever sees "server exited (code 1)".
+  const harnessTail = [];
+  if (child.stderr) {
+    child.stderr.setEncoding('utf8');
+    let derr = '';
+    child.stderr.on('data', (chunk) => {
+      derr += chunk;
+      let j;
+      while ((j = derr.indexOf(String.fromCharCode(10))) >= 0) {
+        const line = derr.slice(0, j).trimEnd(); derr = derr.slice(j + 1);
+        if (!line.trim()) continue;
+        harnessTail.push(line);
+        if (harnessTail.length > 20) harnessTail.shift();
+        process.stderr.write('[dsh-harness] ' + line + String.fromCharCode(10));
+      }
+    });
+  }
   // A failed spawn used to be SILENT (no 'error' listener): the caller just
   // spun until the port timeout. Surface it immediately.
   child.on('error', (e) => process.stderr.write(`[adapter] DSH SPAWN FAILED: ${e.message}\n`));
@@ -403,6 +403,7 @@ function reallySpawn(fixedPort) {
   child.on('exit', (code, signal) => {
     dsh = null;
     process.stderr.write(`[adapter] dsh server exited (code ${code} signal ${signal ?? 'none'})\n`);
+    if (harnessTail.length) process.stderr.write('[adapter] the harness said:' + String.fromCharCode(10) + harnessTail.join(String.fromCharCode(10)) + String.fromCharCode(10));
   });
   return child;
 }
@@ -1247,7 +1248,14 @@ function configPlane(method, id, p) {
         const ids = csvIds(f.customModels);
         if (ids.length) { value.models = toModels(ids); cfgState.addedModels[newId] = ids; saveCfgState(); }
         await nativeCall(settingsWrite(() => rpc('settings.mutate', { ns: 'llm-pi-ai', ops: [{ op: 'set', path: ['providers', newId], value }], ...(p.expectedRevision !== undefined ? { expectedRevision: p.expectedRevision } : {}) })));
-        grants.set(ref, String(f.apiKey)); // memory only; the file carries `ref`
+        grants.set(ref, String(f.apiKey)); // memory: the child env of future spawns
+        // Persist into the harness's OWN credential store ($DSH_HOME/.credentials.yaml,
+        // 0600). Memory-only was the state where every saved private connection
+        // silently said needs-auth on the next launch: the key the user just typed
+        // must survive this adapter process. Only this harness's store is written.
+        try { await nativeCall(rpc('credentials.set', { ref, value: String(f.apiKey) })); }
+        catch (e) { process.stderr.write(`[adapter] credentials.set failed for ${ref}: ${e.message}
+`); }
         const all = await connectionRows(); // BEFORE restartIdle (which kills the server)
         restartIdle();
         return ok({ connection: viewRow(all.find((r) => r.id === newId) || { id: newId, providerId: newId, label: value.displayName, status: 'connected', revision: 0, secretConfigured: true }), requires: 'none' });
@@ -1280,8 +1288,17 @@ function configPlane(method, id, p) {
         }
         if (ops.length) await nativeCall(settingsWrite(() => rpc('settings.mutate', { ns: 'llm-pi-ai', ops, expectedRevision: row.revision })));
       }
-      if (f.apiKey !== undefined && f.apiKey !== '') grants.set(row._ref, String(f.apiKey));
-      else if (policy === 'clear') grants.delete(row._ref);
+      if (f.apiKey !== undefined && f.apiKey !== '') {
+        grants.set(row._ref, String(f.apiKey));
+        try { await nativeCall(rpc('credentials.set', { ref: row._ref, value: String(f.apiKey) })); }
+        catch (e) { process.stderr.write(`[adapter] credentials.set failed for ${row._ref}: ${e.message}
+`); }
+      } else if (policy === 'clear') {
+        grants.delete(row._ref);
+        try { await nativeCall(rpc('credentials.unset', { ref: row._ref })); }
+        catch (e) { process.stderr.write(`[adapter] credentials.unset failed for ${row._ref}: ${e.message}
+`); }
+      }
       const all = await connectionRows(); // BEFORE restartIdle
       const fresh = all.find((r) => r.id === row.id) || row;
       restartIdle();
@@ -1297,6 +1314,9 @@ function configPlane(method, id, p) {
       if (connInUse(row.id)) throw fail('busy-session-active', 'connection is in use by the active turn');
       await nativeCall(settingsWrite(() => rpc('settings.mutate', { ns: 'llm-pi-ai', ops: [{ op: 'unset', path: ['providers', row.id] }] })));
       grants.delete(row._ref);
+      try { await nativeCall(rpc('credentials.unset', { ref: row._ref })); }
+      catch (e) { process.stderr.write(`[adapter] credentials.unset failed for ${row._ref}: ${e.message}
+`); }
       delete cfgState.addedModels[row.id]; saveCfgState();
       restartIdle();
       ok({});
@@ -1587,12 +1607,12 @@ function handle(msg) {
 case 'config/set': {
       process.stderr.write(`[adapter] config/set got ${JSON.stringify(params.config)}\n`);
       const cfg = params.config || {};
-      const model = cfg.model;
+      const model = cfg.model ?? (cfg.thinkingLevel !== undefined ? cfgApplied?.model : undefined);
       const presetId = cfg.presetId;
       const plan = cfg.plan;
       const review = cfg.review;
       const thinkingLevel = cfg.thinkingLevel;
-      if (model === undefined && presetId === undefined && plan === undefined && review === undefined) {
+      if (model === undefined && presetId === undefined && plan === undefined && review === undefined && thinkingLevel === undefined) {
         // connection-only set with no model/preset/plan/review: nothing applicable at creation
         if (!cfg.connectionId) { send({ jsonrpc: '2.0', id, result: {} }); return; }
       }
@@ -1669,7 +1689,7 @@ case 'config/set': {
         // efforts, or clear it, so switching models cannot leak an incompatible
         // effort. Never guess an effort the model does not list.
         const patch = { provider: routeId, model };
-        const efforts = (entry.reasoning && entry.reasoning.efforts) || [];
+        const efforts = ((entry.reasoning && entry.reasoning.efforts) || []).map((effort) => typeof effort === 'string' ? effort : effort.id);
         // A requested level must be one this model actually accepts; an omitted
         // level keeps dsh's own value rather than inventing one.
         if (thinkingLevel !== undefined && thinkingLevel !== null) {
