@@ -1,11 +1,13 @@
 {
   "id": "deepseek",
   "pluginType": "harness-adapter",
+  "name": "DeepSeek Harness",
+  "summary": "Drives the dsh web server over loopback; sessions, approvals and resume are the harness's own.",
   "icons": {
     "light": "logo.svg",
     "dark": "logo.svg"
   },
-  "version": "0.1.5",
+  "version": "0.1.6",
   "protocol": 0,
   "command": [
     "node",
@@ -35,5 +37,8 @@
     "compact",
     "rename",
     "skills"
-  ]
+  ],
+  "release": {
+    "repository": "sabishii-me/agent-hub-harness-adapter-deepseek"
+  }
 }
