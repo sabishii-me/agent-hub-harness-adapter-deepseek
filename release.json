@@ -1,5 +1,0 @@
-{
-  "name": "DeepSeek Harness",
-  "summary": "Drives the dsh web server over loopback; sessions, approvals and resume are the harness's own.",
-  "repository": "sabishii-me/agent-hub-harness-adapter-deepseek"
-}
