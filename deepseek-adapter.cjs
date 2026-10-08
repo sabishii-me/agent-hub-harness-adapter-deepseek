@@ -94,7 +94,12 @@ let DSH_RUNTIME;
 try { DSH_RUNTIME = JSON.parse(rawRuntime); } catch { die('AGENT_HUB_RUNTIME_COMMAND is not valid JSON'); }
 if (!Array.isArray(DSH_RUNTIME) || !DSH_RUNTIME.length) die('AGENT_HUB_RUNTIME_COMMAND must be a non-empty argv array');
 const DSH_BIN = DSH_RUNTIME[DSH_RUNTIME.length - 1];
-if (!fs.existsSync(DSH_BIN)) die(`dsh runtime not found: ${DSH_BIN} (the plugin's runtime is missing)`);
+// The runtime is NOT required at startup. A fresh install lands this adapter WITHOUT its
+// runtime and the hub then calls `runtime/prepare` to materialise it (this adapter owns that:
+// see the `runtime/prepare` case, which installs the manifest's pin). Dying here made
+// `runtime/prepare` UNREACHABLE and the plugin uninstallable (docs/issues/20261008-005306).
+// The real requirement is at the point of USE (`startServerAsync`), where a missing runtime is
+// reported honestly instead of killing the process.
 
 // --- DSH_HOME --------------------------------------------------------------
 // ONE home, inside the hub's own data dir. There is no "system scope": it pointed
@@ -285,6 +290,9 @@ function attach(p) {
 
 // Every adapter looks for the shared server; exactly one of them becomes its owner.
 function startServerAsync() {
+  // The runtime must exist to be spawned. Checked HERE (point of use), not at startup, so
+  // `runtime/prepare` can install it first on a fresh install.
+  if (!fs.existsSync(DSH_BIN)) die(`dsh runtime not found: ${DSH_BIN} (the plugin's runtime is missing)`);
   bootstrapHome();
   return (async () => {
     const known = publishedPort();
@@ -1078,29 +1086,49 @@ const toModels = (ids, models) => ids.map((id) => {
   };
 });
 
-// GET <url>/models (OpenAI shape) to learn what an injected provider serves;
-// dsh rejects a route that declares no models.
-function probeModels(url, value) {
+// WHERE a provider's model list lives is a property of the DIALECT it speaks, not
+// something to assume. An OpenAI-compatible endpoint serves GET <base>/models; an
+// Anthropic-messages endpoint serves GET <base>/v1/models (its SDK appends /v1).
+// Try the dialect's path FIRST, then the other; only fail when neither answers.
+// dsh rejects a route that declares no models, so a wrong path turns a working
+// provider into 'cannot inject provider'.
+function modelsPathsFor(api, base) {
+  const openai = base + '/models';
+  const anthropic = base + '/v1/models';
+  return api === 'anthropic-messages' ? [anthropic, openai] : [openai, anthropic];
+}
+function fetchModelsOnce(mod, u, base, value) {
+  return new Promise((resolve, reject) => {
+    const req = mod.request({ method: 'GET', hostname: u.hostname, port: u.port || undefined, path: base, headers: { authorization: 'Bearer ' + value }, timeout: 15000 }, (res) => {
+      let b = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { b += d; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) return reject(new Error(`${base} -> ${res.statusCode}`));
+        let j; try { j = JSON.parse(b); } catch { return reject(new Error(`${base} is not JSON`)); }
+        const list = Array.isArray(j.data) ? j.data : Array.isArray(j.models) ? j.models : null;
+        if (!list) return reject(new Error(`${base} has no model array`));
+        resolve(list.map((m) => (typeof m === 'string' ? m : m.id)).filter(Boolean));
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error(`${base} timed out`)));
+    req.on('error', reject);
+    req.end();
+  });
+}
+function probeModels(url, value, api) {
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(url); } catch { return reject(new Error('invalid provider url: ' + url)); }
     const mod = u.protocol === 'https:' ? https : http;
     const base = u.pathname.replace(/\/$/, '');
-    const req = mod.request({ method: 'GET', hostname: u.hostname, port: u.port || undefined, path: base + '/models', headers: { authorization: 'Bearer ' + value }, timeout: 15000 }, (res) => {
-      let b = '';
-      res.setEncoding('utf8');
-      res.on('data', (d) => { b += d; });
-      res.on('end', () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) return reject(new Error(`provider ${url} /models -> ${res.statusCode}`));
-        let j; try { j = JSON.parse(b); } catch { return reject(new Error('provider /models is not JSON')); }
-        const list = Array.isArray(j.data) ? j.data : Array.isArray(j.models) ? j.models : null;
-        if (!list) return reject(new Error('provider /models has no model array'));
-        resolve(list.map((m) => (typeof m === 'string' ? m : m.id)).filter(Boolean));
-      });
-    });
-    req.on('timeout', () => req.destroy(new Error('provider /models timed out')));
-    req.on('error', reject);
-    req.end();
+    const paths = modelsPathsFor(api, base);
+    let lastErr = null;
+    const attempt = (i) => {
+      if (i >= paths.length) return reject(new Error(`provider ${url} models: ${lastErr ? lastErr.message : 'no path answered'}`));
+      fetchModelsOnce(mod, u, paths[i], value).then(resolve, (e) => { lastErr = e; attempt(i + 1); });
+    };
+    attempt(0);
   });
 }
 
@@ -1401,7 +1429,7 @@ function configPlane(method, id, p) {
       if (p.url) {
         const routeId = 'hub-' + String(p.connectionId || 'provider').replace(/[^A-Za-z0-9_.-]/g, '_');
         const ref = defaultRef(routeId);
-        const ids = await probeModels(p.url, p.value).catch((e) => { throw fail('unknown-provider', `cannot inject provider ${p.url}: ${e.message}`); });
+        const ids = await probeModels(p.url, p.value, p.api).catch((e) => { throw fail('unknown-provider', `cannot inject provider ${p.url}: ${e.message}`); });
         const pi = await nsView('llm-pi-ai');
         // The provider's definition says which protocol it speaks; only a
         // provider registered without one falls back to the historical default.
