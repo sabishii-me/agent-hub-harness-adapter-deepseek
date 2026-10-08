@@ -7,7 +7,7 @@
     "light": "logo.svg",
     "dark": "logo.svg"
   },
-  "version": "0.1.8",
+  "version": "0.1.9",
   "protocol": 0,
   "command": [
     "node",
@@ -15,7 +15,7 @@
   ],
   "runtime": {
     "package": "@deepseek-ai/dsh",
-    "version": "0.1.0-rc.7",
+    "version": "0.2.0-rc.2",
     "command": [
       "node",
       "runtime/lib/bin.js"
